@@ -41,6 +41,33 @@ def compute_ricci_tensor(x_vars, model):
 
     return R_ij
 
+@tf.function
+def compute_scalar_curvature(coords, model):
+    """
+    Computes the scalar curvature for a given patch submodel.
+
+    Args:
+        coords (tf.Tensor): Coordinates of shape [batch_size, dim].
+        patch_submodel (tf.keras.Model): The submodel that outputs the lower-triangular metric vector.
+
+    Returns:
+        tf.Tensor: Scalar curvature at each point (shape [batch_size]).
+    """
+    # Predict metric and convert to matrix form
+    metric_pred = model(coords)  # [batch, dim*(dim+1)//2]
+    metric_mat = cholesky_from_vec(metric_pred)  # [batch, dim, dim]
+    
+    # Compute Ricci tensor using same patch model
+    ricci = compute_ricci_tensor(coords, model)  # [batch, dim, dim]
+
+    # Compute inverse of the metric
+    inv_metric = tf.linalg.inv(metric_mat)  # [batch, dim, dim]
+
+    # Compute scalar curvature via contraction: g^ij R_ij
+    scalar_curvature = tf.einsum("sij,sij->s", inv_metric, ricci)  # [batch]
+
+    return scalar_curvature
+
 
 # Bonus function --> currently unused as above computes Christoffel symbols implicitly
 @tf.function

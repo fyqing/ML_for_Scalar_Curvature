@@ -1,12 +1,12 @@
 import tensorflow as tf
-from losses.ball import TotalBallLoss
+from losses.ball import ConformalLoss
 from network.base import BaseNetwork
 
 tfk = tf.keras
 tfk.backend.set_floatx("float64")
 from geometry.ball import PatchChange_Coordinates_Ball
 from keras.saving import register_keras_serializable
-from network.base import BaseGlobalModel, BasePatchSubmodel
+from network.base import BaseGlobalModel, BasePatchSubmodel, GlobalConformalModel_L2
 
 
 @register_keras_serializable()
@@ -84,12 +84,14 @@ class BallNetwork(BaseNetwork):
     def __init__(self, hp, print_losses=False, restore_hps=False):
         super().__init__(hp, print_losses, restore_hps)
 
-        # Build the model
         if not hasattr(self, "model"):
-            self.model = BallGlobalModel(self.hp)
+            # This is the key change: instantiate your new conformal model.
+            # The 'conformal_mode' hp is checked inside BaseNetwork.__init__ now.
+            self.model = GlobalConformalModel_L2(self.hp)
 
-        # Define the loss
-        self.loss = TotalBallLoss(hp=self.hp, print_losses=print_losses)
+        # Define the loss function to be the new ConformalLoss
+        # This will be used by the `evaluate_loss` method in the parent class.
+        self.loss = ConformalLoss(hp=self.hp, print_losses=print_losses)
 
     def evaluate_loss(
         self, x, training=True, return_constituents=False, val_print=True

@@ -7,18 +7,25 @@
 ###############################################################################
 # Geometric set-up
 # Dimensionality of the data (e.g., 2 for 2D data)
-dim: 3
+dim: 2
 
 # Set the number of patches (current functionality for 1 or 2)
 n_patches: 2 
 
+# Loss type, choose from "einstein", "scalar"
+loss_type: "scalar"
+
+# Prescribed scalar curvature, choose from "zero", "cos2_theta_plus_offset", "gaussian_bump", 
+# "double_peak", "round", "step_equator", "sinusoidal", "north_pole_bump", "tilted_step_smooth"
+K_kind: "round"
+
 # Einstein constant, $\lambda$, in Einstein eqn: $R_{ij} = \lambda g_{ij}$
-einstein_constant: 1.0
+# einstein_constant: 1.0
 
 # Patching size
 # ...determines the distance from the radial midpoint to the outer edge of the 
 # overlap region within the ball patches
-overlap_upperwidth: 0.1 
+# overlap_upperwidth: 0.1 
 
 ###############################################################################
 # Data set-up
@@ -37,7 +44,7 @@ density_power: 4.
 num_samples: 10000
 
 # choose from 'round', 'round_noise', 'conformal_bump', 'asymmetric_hemisphere', 'squashed_sphere'
-init_metric_type: squashed_sphere
+init_metric_type: "round"
 
 # only for round_noise tuning
 # init_noise_std: 0.01
@@ -47,15 +54,16 @@ init_metric_type: squashed_sphere
 # bump_amplitude: 0.1
 
 # only for asymmetric_hemisphere tuning
-asym_amp: 0.3
-asym_slope: 20.0
+# asym_amp: 0.1
+# asym_slope: 10.0
 
 ###############################################################################
 # Loss set-up
 # Multiplier values for the loss contributions
-einstein_multiplier: 1.0
-overlap_multiplier: 10.0   
-finiteness_multiplier: 1.0  
+# einstein_multiplier: 1.0
+# overlap_multiplier: 10.0 
+scalar_loss_multiplier: 1.0  
+finiteness_multiplier: 5.0  
 
 # Finiteness filter hyperparameters
 # Centre of the minimum
@@ -72,9 +80,9 @@ finite_slope: 0.2
 ###############################################################################
 # Model set-up
 # Import a saved model instead of initiating a new one (null means randomly initialise)
-saved_model: true
-save_flag: squashed_sphere
-saved_model_path: runs_supervised/supervised_model_squashed_sphere.keras
+saved_model: false
+save_flag: round
+saved_model_path: null
 # ...the below are ignored if `saved_model` is true and a model is imported
 
 # Number of hidden units in each layer
@@ -88,6 +96,10 @@ activations: gelu
 
 # Whether to use bias terms in the neural network layers
 use_bias: true
+
+# conformal mode
+conformal_mode: "L2"         
+base_metric_kind: "round"
 
 # Seeds
 np_seed: null
@@ -117,7 +129,7 @@ verbosity: 1
 ###############################################################################
 #Logging set-up
 # Enable or disable logging to Weights and Biases (WandB)
-log_wandb: false
+log_wandb: true
 wandb_log_freq: 10
 
 # Whether to log interim results during training (best or scheduled). Setting
@@ -133,11 +145,12 @@ log_interval: null
 track_best: true
 # Save the historical best losses? Setting to false overwrites the previous
 # best loss for the run
-save_best_hist: false
+save_best_hist: true
 # Log batches and model when numerical errors occur?
 log_errors: true
 
 # Whether to print a breakdown of individual loss terms with each training step
-print_losses: false
-print_interval: 1   
+print_losses: true
+print_interval: 100
+
 

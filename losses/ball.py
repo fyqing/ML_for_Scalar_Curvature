@@ -1,11 +1,111 @@
 import tensorflow as tf
 
 tf.keras.backend.set_floatx("float64")
-from geometry.ball import PatchChange_Coordinates_Ball, PatchChange_Metric_Ball
 from geometry.common import compute_ricci_tensor
 from helper_functions.helper_functions import RadiusWeighting, cholesky_from_vec
+from geometry.common import compute_scalar_curvature
+from geometry.ball import prescribed_K, patch_xy_to_xyz, PatchChange_Coordinates_Ball, PatchChange_Metric_Ball
+
+class ScalarLoss:
+    """
+    Computes the loss |R(g) - K_prescribed|^2 for a given patch.
+    This class is self-contained and handles the geometry calculation.
+    """
+    def __init__(self, hp, patch_idx=0):
+        self.hp = hp
+        self.K_kind = self.hp.get("K_kind", "round")
+        self.patch_idx = int(patch_idx)
+
+    def compute(self, coords, patch_model_callable):
+        """
+        Args:
+            coords (tf.Tensor): The coordinates for this patch.
+            metric_cholesky_vec_callable (callable): A function that takes coordinates 
+                                                      and returns the predicted Cholesky vector.
+        """
+        # compute_scalar_curvature expects a model/callable that it can pass coordinates to.
+        scalar_curv_pred = compute_scalar_curvature(coords, patch_model_callable)
+        K_target = prescribed_K(coords, kind=self.K_kind, patch_idx=self.patch_idx)
+        
+        return tf.reduce_mean(tf.square(scalar_curv_pred - K_target))
 
 
+class ConformalLoss:
+    """
+    Computes the total loss for the GlobalConformalModel_L2.
+    This version correctly uses the model's patch callables.
+    """
+    def __init__(self, hp, print_losses=False):
+        self.hp = hp
+        self.n_patches = self.hp.get("n_patches", 2)
+
+        self.print_losses = print_losses
+        self.print_interval = self.hp.get("print_interval", 100) # Print every 100 steps
+        self.step_count = tf.Variable(0, dtype=tf.int64, trainable=False, name="conformal_loss_step_counter")
+
+        self.scalar_loss_calculators = [
+            ScalarLoss(hp=self.hp, patch_idx=i) for i in range(self.n_patches)
+        ]
+        
+        self.scalar_loss_multiplier = self.hp.get("scalar_loss_multiplier", 1.0)
+        self.finiteness_multiplier = self.hp.get("finiteness_multiplier", 0.01)
+
+    def call(self, model, x_vars, metric_pred, return_constituents=False, val_print=True):
+        """
+        Calculates the total loss.
+        Note: The `metric_pred` argument is no longer used here, as we get the
+              predictions by calling the submodels directly.
+        """
+        # 1. Get the patch coordinates and the corresponding model callables.
+        if self.n_patches == 2:
+            coords_p2 = model.patch_transform_layer(x_vars)
+            
+            # The GlobalConformalModel_L2 conveniently provides these callables.
+            callable_p1 = model.patch_submodels[0]
+            callable_p2 = model.patch_submodels[1]
+
+            # 2. Compute the scalar loss for each patch.
+            loss1 = self.scalar_loss_calculators[0].compute(x_vars, callable_p1)
+            loss2 = self.scalar_loss_calculators[1].compute(coords_p2, callable_p2)
+            scalar_losses = [loss1, loss2]
+
+        else: # Single patch case
+            # For a single patch, the main model itself is the callable.
+            loss1 = self.scalar_loss_calculators[0].compute(x_vars, model)
+            scalar_losses = [loss1]
+
+        total_scalar_loss = tf.add_n(scalar_losses)
+
+        # 3. Finiteness/Regularization Loss on the conformal factor `u`.
+        xyz_coords = patch_xy_to_xyz(x_vars, patch_idx=0)
+        u_vals = model.u_model(xyz_coords)
+        finiteness_loss_val = tf.reduce_mean(tf.square(u_vals))
+
+        # 4. Combine the losses.
+        total_loss = (self.scalar_loss_multiplier * total_scalar_loss + 
+                      self.finiteness_multiplier * finiteness_loss_val)
+        
+        if self.print_losses:
+            self.step_count.assign_add(1)
+            if tf.equal(self.step_count % self.print_interval, 0):
+                tf.print("Total Combined Loss:", total_loss)
+                for i, s_loss in enumerate(scalar_losses):
+                    tf.print("Scalar Loss Patch", i, ":", s_loss)
+                tf.print("Finiteness Loss (u^2):", finiteness_loss_val)
+
+        # 5. Handle logging.
+        if return_constituents:
+            loss_constituents = {
+                "scalar_loss": total_scalar_loss,
+                "finiteness_loss": finiteness_loss_val,
+                "total_loss": total_loss,
+            }
+            for i, loss in enumerate(scalar_losses):
+                loss_constituents[f"scalar_loss_patch_{i}"] = loss
+            return total_loss, loss_constituents
+        
+        return total_loss, None
+    
 class TotalBallLoss:
     """
     Represents a class for computing the total training loss, which has
@@ -44,9 +144,42 @@ class TotalBallLoss:
         self.n_patches = self.hp["n_patches"]
         self.overlap_upperwidth = self.hp["overlap_upperwidth"]
         self.print_losses = print_losses
+        self.print_interval = self.hp["print_interval"]
+        self.step_count = 0
 
-        # Einstein constant, $\lambda$ in the Einstein equation: $R_{ij} = \lambda g_{ij}$
-        self.einstein_constant = self.hp["einstein_constant"]
+        # Set the Loss type
+        self.loss_type = self.hp.get("loss_type", "einstein")
+
+        # Initialize the scalar loss if required
+        if self.loss_type == "scalar":
+            if self.n_patches == 1:
+                self.scalar_losses = [
+                    ScalarLoss(kind=self.hp.get("K_kind", "zero"),patch_idx=0)
+                ]
+            else:
+                self.scalar_losses = [
+                    ScalarLoss(kind=self.hp.get("K_kind", "zero"), patch_idx=i)
+                    for i in range(int(self.n_patches))
+                ]
+
+        # Initialize Einstein loss if needed
+        elif self.loss_type == "einstein":
+            self.einstein_constant = self.hp["einstein_constant"]
+            if self.n_patches == 1:
+                self.einstein_losses = [
+                    EinsteinLoss(self.num_dimensions, self.einstein_constant, False)
+                ]
+            else:
+                self.einstein_losses = [
+                    EinsteinLoss(
+                        self.num_dimensions,
+                        self.einstein_constant,
+                        True,
+                        self.overlap_upperwidth,
+                    )
+                    for _ in range(int(self.n_patches))
+                ]
+
 
         # Loss multipliers
         self.einstein_multiplier = self.hp["einstein_multiplier"]
@@ -60,37 +193,6 @@ class TotalBallLoss:
         ), "All loss terms turned off..."
         if self.n_patches == 1:
             self.overlap_multiplier = tf.cast(0.0, tf.float64)
-
-        # Einstein Loss
-        if self.n_patches == 1:
-            self.einstein_losses = [
-                EinsteinLoss(self.num_dimensions, self.einstein_constant, False)
-            ]
-        else:
-            self.einstein_losses = [
-                EinsteinLoss(
-                    self.num_dimensions,
-                    self.einstein_constant,
-                    True,
-                    self.overlap_upperwidth,
-                )
-                for patch in range(int(self.n_patches))
-            ]
-
-        # Overlap Loss
-        if self.n_patches == 1:
-            self.overlap_loss = tf.cast(0.0, tf.float64)
-        elif self.n_patches == 2:
-            self.overlap_loss = OverlapLossBall(
-                self.num_dimensions, True, self.overlap_upperwidth
-            )
-        else:
-            self.overlap_loss = tf.cast(0.0, tf.float64)
-            print(
-                f"Overlap loss not yet configured for {self.n_patches} patches...",
-                flush=True,
-            )
-            exit(1)
 
         # Finiteness Loss
         self.filter_hyperparameters = [
@@ -125,20 +227,22 @@ class TotalBallLoss:
             metric_preds.append(metric_pred)
 
         # Compute the loss components
-        # Einstein
-        if self.einstein_multiplier > 0.0:
+        if self.loss_type == "scalar":
             e_losses = [
-                self.einstein_losses[patch_idx].compute(
-                    patch_inputs[patch_idx],
-                    metric_preds[patch_idx],
-                    model.patch_submodels[patch_idx],
+                self.scalar_losses[i].compute(
+                    patch_inputs[i], model.patch_submodels[i]
                 )
-                for patch_idx in range(int(self.n_patches))
+                for i in range(self.n_patches)
+            ]
+        elif self.loss_type == "einstein":
+            e_losses = [
+                self.einstein_losses[i].compute(
+                    patch_inputs[i], metric_preds[i], model.patch_submodels[i]
+                )
+                for i in range(self.n_patches)
             ]
         else:
-            e_losses = [
-                tf.cast(0.0, tf.float64) for patch_idx in range(int(self.n_patches))
-            ]
+            raise ValueError(f"Unsupported loss_type: {self.loss_type}")
 
         # Overlap
         if self.overlap_multiplier > 0.0 and self.n_patches == 2:
@@ -158,11 +262,11 @@ class TotalBallLoss:
             ]
         else:
             f_losses = [
-                tf.cast(0.0, tf.float64) for patch_idx in range(int(self.n_patches))
+                tf.cast(0.0, tf.float64) for _ in range(int(self.n_patches))
             ]
 
         # Print the batch loss values
-        if self.print_losses and val_print:
+        if self.print_losses and (self.step_count + 1) % self.print_interval == 0:
             print(
                 f"Einstein: {[tf.get_static_value(e_loss) for e_loss in e_losses]}\nOverlap: {tf.get_static_value(overlap_loss)}\nFinite: {[tf.get_static_value(f_loss) for f_loss in f_losses]}\n"
             )
@@ -199,6 +303,7 @@ class TotalBallLoss:
             + self.finiteness_multiplier
         )
 
+        self.step_count += 1
         return total_loss, loss_constituents
 
 
@@ -257,81 +362,6 @@ class EinsteinLoss:
         einstein_loss = tf.reduce_mean(norm)
 
         return einstein_loss
-
-
-class OverlapLossBall:
-    """
-    Represents a class for computing the overlap loss, which measures the
-    difference between agreement of the metric predictions between the patches.
-    This uses symmetric contributions from the difference between the metric
-    prediction in patch 1 and the metric prediction for patch 2 transformed
-    into patch 1, and equivalently the difference between the metric prediction
-    in patch 2 and the metric prediction for patch 1 transformed into patch 2.
-    The contributions are weighted by the points radial positions, prioirtising
-    points within the overlap region which is an annulus about the radial midpoint.
-
-    Attributes:
-    - dim (int): The dimensionality of the metric tensor (number of x coords).
-    - weight_radially (bool): Whether to apply radial weighting to the points.
-    - overlap_upperwidth (float): distance from the radial midpoint to the edge
-      of the patch area of interest, outisde of here and the transformed lower
-      bound, the radial filter devalues point contributions.
-
-    Methods:
-    - __init__(self, num_dimensions, weight_radially, overlap_upperwidth):
-      Initializes the OverlapLossBall class with the respective loss hyperparameters.
-
-    - compute(self, x_vars, metric_pred):
-      Computes the overlap loss, which is defined as the norm of the
-      differences between metric preditions in each patch and their transforms
-      between these patches, weighted to prioiritise points in the overlap region.
-    """
-
-    def __init__(
-        self, num_dimensions, weight_radially=True, overlap_upperwidth=0.1
-    ) -> None:
-        self.dim = num_dimensions
-        self.weight_radially = weight_radially
-        self.overlap_upperwidth = overlap_upperwidth
-
-    def compute(self, x_vals, metric_preds):
-        # Convert the outputs to metrics
-        patch_1_metric_pred = tf.map_fn(cholesky_from_vec, metric_preds[0])
-        patch_2_metric_pred = tf.map_fn(cholesky_from_vec, metric_preds[1])
-
-        # Compute the patch changes of the both outputs
-        patch_2_metrics_from_patch_1 = PatchChange_Metric_Ball(
-            x_vals, patch_1_metric_pred
-        )
-        patch_1_metrics_from_patch_2 = PatchChange_Metric_Ball(
-            PatchChange_Coordinates_Ball(x_vals), patch_2_metric_pred
-        )
-
-        # Take the total difference in both patches between the metrics in both patches
-        overlap_loss = tf.reduce_mean(
-            abs(patch_2_metrics_from_patch_1 - patch_2_metric_pred), axis=(1, 2)
-        ) + tf.reduce_mean(
-            abs(patch_1_metrics_from_patch_2 - patch_1_metric_pred), axis=(1, 2)
-        )
-
-        # Apply radial weighting
-        if self.weight_radially:
-            radial_midpoint = tf.cast(tf.sqrt(2.0) - 1.0, tf.float64)
-            filter_lower_bound = (1 - (radial_midpoint + self.overlap_upperwidth)) / (
-                1 + (radial_midpoint + self.overlap_upperwidth)
-            )
-            filter_midpoint = (
-                (radial_midpoint + self.overlap_upperwidth) + filter_lower_bound
-            ) / 2.0
-            filter_width = radial_midpoint + self.overlap_upperwidth - filter_midpoint
-            radial_weights = RadiusWeighting(
-                x_vals, filter_width=filter_width, filter_midpt=filter_midpoint
-            )
-            overlap_loss = radial_weights * overlap_loss
-
-        overlap_loss = tf.reduce_mean(overlap_loss)
-
-        return overlap_loss
 
 
 class FiniteLoss:
@@ -476,19 +506,6 @@ class GlobalLossBall:
             for _ in range(int(self.n_patches))
         ]
 
-        # Overlap Loss
-        if self.n_patches == 1:
-            self.overlap_loss = tf.cast(0.0, tf.float64)
-        elif self.n_patches == 2:
-            self.overlap_loss = OverlapLossBall(
-                self.num_dimensions, weight_radially=False
-            )
-        else:
-            self.overlap_loss = 0.0
-            print(
-                f"Overlap loss not yet configured for {self.n_patches} patches...",
-                flush=True,
-            )
 
     def call(self, model, x_vars, metric_pred):
         # Set up the network inputs & outputs

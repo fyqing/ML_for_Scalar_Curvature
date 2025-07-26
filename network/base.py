@@ -10,9 +10,12 @@ import numpy as np
 
 import wandb
 from helper_functions import helper_functions
+from helper_functions.helper_functions import cholesky_to_vec
 from losses.ball import TotalBallLoss
 from network import network_analysis, schedulers
 from keras.saving import register_keras_serializable
+from geometry.common import compute_scalar_curvature, compute_ricci_tensor
+from geometry.ball import PatchChange_Coordinates_Ball, build_conformal_metric_global
 
 
 @register_keras_serializable()
@@ -199,6 +202,7 @@ class BasePatchSubmodel(tf.keras.Model):
         final_layer.bias.assign(bias_init.astype(np.float64))
         print("Bias after assignment:", final_layer.bias.numpy()[:dim*(dim+1)//2])
 
+
 @register_keras_serializable()
 class BaseGlobalModel(tf.keras.Model):
     """
@@ -267,7 +271,117 @@ class BaseGlobalModel(tf.keras.Model):
     def from_config(cls, config):
         return cls(**config)
 
+@tfk.utils.register_keras_serializable()
+class GlobalConformalModel_L2(tf.keras.Model):
+    """
+    Global conformal S^2 metric model: g = exp(2u) * g0.
+    - u: single scalar NN taking xyz on S^2.
+    - call(): expects North-patch coords [batch,2]; returns concatenated
+      Cholesky vec for all patches: [v1 | v2] shape [batch, 3*n_patches].
+    - patch_submodels[i](coords)->cholesky_vec for patch i (legacy loss API).
+      Implemented as Python closures (not Keras Layers) to avoid recursion.
+    """
+    def __init__(self, hp, **kwargs):
+        super().__init__(**kwargs)
+        self.hp = hp
+        self.dim = hp["dim"]
+        if self.dim != 2:
+            raise ValueError("GlobalConformalModel_L2 expects dim=2 (S^2).")
+        self.n_patches = hp["n_patches"]
+        if self.n_patches not in (1, 2):
+            raise ValueError("n_patches must be 1 or 2.")
+        self.base_metric_kind = hp.get("base_metric_kind", "round")
 
+        # ----- global u network: xyz -> scalar -----
+        h = hp["n_hidden"]
+        L = hp["n_layers"]
+        act = hp["activations"]
+        use_bias = hp["use_bias"]
+
+        inp = tfk.layers.Input(shape=(3,), dtype=tf.float64)
+        x = tfk.layers.Dense(h, activation=act, use_bias=use_bias)(inp)
+        for _ in range(L - 2):
+            x = tfk.layers.Dense(h, activation=act, use_bias=use_bias)(x)
+        out = tfk.layers.Dense(1, activation=None, use_bias=True)(x)
+        self.u_model = tfk.Model(inp, out, name="global_u_model")
+
+        # init u≈0 -> start at g=g0
+        self.u_model.layers[-1].bias.assign(
+            tf.zeros_like(self.u_model.layers[-1].bias)
+        )
+
+        # patch coord transform (N->S)
+        self.patch_transform_layer = PatchChange_Coordinates_Ball
+
+        # compatibility: patch_submodels = list of python callables
+        self.patch_submodels = []
+        for pidx in range(self.n_patches):
+            self.patch_submodels.append(self._make_patch_callable(pidx))
+
+    # helpers
+    def _u_global(self, xyz, training=False):
+        """xyz [batch,3] -> u [batch]."""
+        u = self.u_model(xyz, training=training)  # [batch,1]
+        return tf.squeeze(u, axis=-1)             # [batch]
+
+    def _make_patch_callable(self, patch_idx):
+        """Return a python callable(coords[,training]) -> cholesky vec for patch."""
+        def _patch_call(coords, training=False):
+            g = build_conformal_metric_global(
+                lambda xyz: self._u_global(xyz, training),
+                coords,
+                patch_idx=patch_idx,
+                kind=self.base_metric_kind,
+            )
+            return cholesky_to_vec(g)
+        return _patch_call
+
+    # main call: full multi-patch forward 
+    def call(self, coords_patch1, training=False):
+        # Patch 1
+        g1 = build_conformal_metric_global(
+            lambda xyz: self._u_global(xyz, training),
+            coords_patch1,
+            patch_idx=0,
+            kind=self.base_metric_kind,
+        )
+        v1 = cholesky_to_vec(g1)  # [batch,3]
+
+        if self.n_patches == 1:
+            return v1
+
+        # Patch 2
+        coords_patch2 = self.patch_transform_layer(coords_patch1)
+        g2 = build_conformal_metric_global(
+            lambda xyz: self._u_global(xyz, training),
+            coords_patch2,
+            patch_idx=1,
+            kind=self.base_metric_kind,
+        )
+        v2 = cholesky_to_vec(g2)  # [batch,3]
+
+        return tf.concat([v1, v2], axis=-1)
+    
+    def get_config(self):
+        config = super().get_config()
+        serializable_hp = {
+            key: value for key, value in self.hp.items() if self._is_serializable(value)
+        }
+        config.update({"hp": serializable_hp})
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+        
+    def _is_serializable(self, value):
+        """Helper to check if a hyperparameter can be saved."""
+        try:
+            tf.keras.utils.serialize_keras_object(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+        
 class BaseNetwork:
     """
     Represents a class for the machine learning processes used in training the
@@ -344,6 +458,35 @@ class BaseNetwork:
                 )  # ...these are overwritten by the imported model
                 self.model.hp = hp
                 self.model.set_serializable_hp()
+        else:
+            mode = self.hp.get("conformal_mode", "").upper()
+            if mode == "L2":
+                self.model = GlobalConformalModel_L2(self.hp)
+            else:
+                # legacy metric-per-patch model path:
+                # compute output units = cholesky_dim * n_patches
+                cholesky_dim = self.hp["dim"] * (self.hp["dim"] + 1) // 2
+                n_out = cholesky_dim  # per patch
+                self.patch_submodels = [
+                    BasePatchSubmodel(self.hp, n_out=n_out, name=f"patch_{i}")
+                    for i in range(self.hp["n_patches"])
+                ]
+                # wrap them so call() stacks patch outputs (legacy).  Minimal inline wrapper:
+                class _LegacyGlobal(tf.keras.Model):
+                    def __init__(self, outer, **kw):
+                        super().__init__(**kw)
+                        self.outer = outer
+                        self.patch_submodels = outer.patch_submodels
+                        self.patch_transform_layer = PatchChange_Coordinates_Ball
+                    def call(self, coords_patch1, training=False):
+                        # patch1 raw
+                        v1 = self.patch_submodels[0](coords_patch1, training=training)
+                        if self.outer.hp["n_patches"] == 1:
+                            return v1
+                        coords_patch2 = self.patch_transform_layer(coords_patch1)
+                        v2 = self.patch_submodels[1](coords_patch2, training=training)
+                        return tf.concat([v1, v2], axis=-1)
+                self.model = _LegacyGlobal(self)            
 
         # Print model summary
         # print('Summary:',self.model.summary())
@@ -473,6 +616,12 @@ class BaseNetwork:
                 # Track progress
                 epoch_loss_avg.update_state(loss_value)  # Add current batch loss
 
+                # Print Ricci tensor and scalar curvature on the full training data at the end of each epoch
+                #ricci = compute_ricci_tensor(x_train, self.model.patch_submodels[0])
+                #print(f"Epoch {epoch+1}: Ricci tensor (train):", ricci.numpy())
+                #scalar_curv = compute_scalar_curvature(x_train, self.model.patch_submodels[0])
+                #print(f"Epoch {epoch+1}: Scalar curvature (train):", scalar_curv.numpy())
+
                 # End epoch
                 train_loss_results.append(epoch_loss_avg.result())
 
@@ -499,6 +648,7 @@ class BaseNetwork:
                     ),
                     flush=True,
                 )
+
 
             # Logging
             if self.log_dir is not None and self.hp["log_interim"]:
