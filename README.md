@@ -1,7 +1,7 @@
-# AInstein: Numerical Metrics on Spheres  
-This repository contains code for learning Einstein metrics ($R_{ij} = \lambda g_{ij}$) on spheres of general dimension, $S^n$.  
+# ML package for the Nirenberg problem
+This repository contains code for learning Riemannian metrics with prescribed scalar curvature function on sphere $S^2$. In particular, we fix the round metric, and search within its pointwise conformal class. This is known as the Nirenberg problem.
   
-The semi-supervised learning is run via the file `run.py`, where manifold properties and training hyperparameters are set using the `hyperparameters/hps.yaml` file. To instead train a supervised model (to either the identity function or the round metric) run the file `run_supervised.py`, which uses hyperparameters from the same yaml file.  
+The package is run via the file `run.py`, where manifold properties and training hyperparameters are set using the `hyperparameters/hps.yaml` file. 
 
 We recommend setting up a new environment for running of this package, the process for this is described in `environment/README.md`.  
 
@@ -18,21 +18,8 @@ python3 run.py --hyperparams=hyperparameters/hps.yaml
 ```
 
 ### Functionality
-The package functionality is split according to: the model in `network/`, the losses in `losses/`, the sampling in `sampling/`, the geometric functions in `geometry/`, and some additional useful functions in `helper_functions/helper_functions.py`. The models are saved into the `runs/` folder (the local filepath to this must first be set in `hps.yaml`), whilst the `runs_supervised/` folder contains the pre-trained supervised models used as initialisations for the published results; more supervised models can be trained and moved to this folder for different architecures and experiments.
+The package functionality is split according to: the model in `network/`, the losses in `losses/`, the sampling in `sampling/`, the geometric functions in `geometry/`, and some additional useful functions in `helper_functions/helper_functions.py`. The models are saved into the `runs/` folder (the local filepath to this must first be set in `hps.yaml`).
 
 A jupyter notebook `examine_output.ipynb` is provided which provides the testing functionality, and allows interactive visualisation of the trained models. Ensure the local filepath to the trained models is set correctly and follow internal instructions to set up the testing.   
   
-### BibTeX Citation  
-``` 
-@article{Hirst:2025seh,
-    author = "Hirst, Edward and Gherardini, Tancredi Schettini and Stapleton, Alexander G.",
-    title = "{AInstein: Numerical Einstein Metrics via Machine Learning}",
-    eprint = "2502.13043",
-    archivePrefix = "arXiv",
-    primaryClass = "hep-th",
-    reportNumber = "QMUL-PH-25-04",
-    month = "2",
-    year = "2025"
-}
-```
 
